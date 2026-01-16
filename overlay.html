@@ -1,0 +1,354 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mile Counter Overlay</title>
+  <style>
+    :root{
+      --pill-bg: rgba(255,255,255,.10);
+      --pill-border: rgba(255,255,255,.18);
+      --text: rgba(255,255,255,.95);
+      --muted: rgba(255,255,255,.70);
+      --shadow: rgba(0,0,0,.35);
+    }
+
+    html,body{height:100%;margin:0;background:transparent;}
+    body{
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }
+
+    /* pill */
+    .pill{
+      position:relative;
+      display:flex;
+      align-items:center;
+      gap:16px;
+      padding:16px 22px 16px 18px;
+      border-radius: 999px;
+      background: var(--pill-bg);
+      border: 1px solid var(--pill-border);
+      box-shadow: 0 14px 40px var(--shadow);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      overflow:hidden; /* important: clips fireworks inside pill */
+      transform-origin:center;
+      user-select:none;
+    }
+
+    .pill::before{
+      content:"";
+      position:absolute; inset:-60% -40%;
+      background: radial-gradient(closest-side, rgba(255,255,255,.18), transparent 60%);
+      transform: translateY(-10%);
+      pointer-events:none;
+      opacity:.35;
+    }
+
+    /* runner */
+    .runner{
+      width:58px;
+      height:58px;
+      flex: 0 0 auto;
+      opacity:.95;
+      filter: drop-shadow(0 8px 18px rgba(0,0,0,.25));
+    }
+
+    /* subtle run motion */
+    .runner .arm, .runner .leg{
+      transform-origin: 50% 50%;
+      animation: swing 0.55s ease-in-out infinite alternate;
+    }
+    .runner .leg{ animation-duration: 0.60s; }
+    @keyframes swing {
+      from { transform: rotate(-8deg) translateY(0px); }
+      to   { transform: rotate(10deg) translateY(1px); }
+    }
+
+    /* right text stack */
+    .stack{
+      display:flex;
+      flex-direction:column;
+      justify-content:center;
+      gap:6px;
+      min-width: 180px;
+    }
+
+    .num{
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      color: var(--text);
+      font-size: 56px; /* tallish */
+      font-variant-numeric: tabular-nums;
+      text-rendering: geometricPrecision;
+    }
+
+    .label{
+      font-size: 18px;
+      font-weight: 500;
+      letter-spacing: 0.02em;
+      color: var(--muted);
+      line-height: 1.1;
+    }
+
+    /* fireworks canvas layer inside pill */
+    canvas#fx{
+      position:absolute;
+      inset:0;
+      width:100%;
+      height:100%;
+      pointer-events:none;
+      opacity:0;
+      transition: opacity .15s ease;
+    }
+
+    .pop{
+      animation: pop 420ms cubic-bezier(.2,.9,.2,1);
+    }
+    @keyframes pop{
+      0%{ transform: scale(1); }
+      40%{ transform: scale(1.05); }
+      100%{ transform: scale(1); }
+    }
+
+    /* optional: tighter mode if you pass &compact=1 */
+    .compact .num{ font-size: 48px; }
+    .compact .label{ font-size: 16px; }
+    .compact .runner{ width:52px;height:52px; }
+  </style>
+</head>
+<body>
+  <div id="pill" class="pill">
+    <!-- fireworks layer -->
+    <canvas id="fx"></canvas>
+
+    <!-- runner SVG -->
+    <svg class="runner" viewBox="0 0 64 64" aria-hidden="true">
+      <!-- head -->
+      <circle cx="44" cy="12" r="6" fill="white" opacity=".95"/>
+      <!-- torso -->
+      <path d="M40 18c-5 4-9 10-10 14l8 4c2-6 4-9 7-12z" fill="white" opacity=".95"/>
+      <!-- arms group -->
+      <g class="arm">
+        <path d="M38 26l-10 8c-2 1-2 4 0 5s4 1 6-1l10-8z" fill="white" opacity=".95"/>
+      </g>
+      <!-- legs group -->
+      <g class="leg">
+        <path d="M34 36l-13 12c-2 2-1 5 1 6s5 0 6-2l13-12z" fill="white" opacity=".95"/>
+        <path d="M38 38l8 14c1 2 4 3 6 2s3-4 2-6l-8-14z" fill="white" opacity=".95"/>
+      </g>
+    </svg>
+
+    <div class="stack">
+      <div id="num" class="num">0.00</div>
+      <div class="label">Miles Completed</div>
+    </div>
+  </div>
+
+  <!-- Firebase (RTDB) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-app.js";
+    import { getDatabase, ref, onValue } from "https://www.gstatic.com/firebasejs/10.12.4/firebase-database.js";
+
+    // ---- query params ----
+    const qs = new URLSearchParams(location.search);
+    const dbUrl = qs.get("db");       // e.g. https://YOURPROJECT-default-rtdb.firebaseio.com
+    const room  = qs.get("room") || "main";
+    const compact = qs.get("compact") === "1";
+    if (!dbUrl) {
+      document.getElementById("num").textContent = "NO DB";
+      console.error("Missing ?db= param");
+    }
+
+    if (compact) document.getElementById("pill").classList.add("compact");
+
+    // Minimal config (we only need databaseURL for RTDB reads)
+    const app = initializeApp({ databaseURL: dbUrl });
+    const db  = getDatabase(app);
+
+    const roomRef = ref(db, `rooms/${room}`);
+
+    // ---- number tween ----
+    const numEl = document.getElementById("num");
+    let currentDisplay = 0;
+
+    function formatMiles(v){
+      const n = Number(v);
+      if (!Number.isFinite(n)) return "0.00";
+      return n.toFixed(2);
+    }
+
+    function tweenTo(target){
+      const start = currentDisplay;
+      const end = target;
+      const dur = 350; // ms
+      const t0 = performance.now();
+
+      function easeOutCubic(t){ return 1 - Math.pow(1 - t, 3); }
+
+      function step(now){
+        const t = Math.min(1, (now - t0)/dur);
+        const eased = easeOutCubic(t);
+        const v = start + (end - start)*eased;
+        currentDisplay = v;
+        numEl.textContent = formatMiles(v);
+        if (t < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }
+
+    // ---- fireworks/confetti inside pill ----
+    const pill = document.getElementById("pill");
+    const canvas = document.getElementById("fx");
+    const ctx = canvas.getContext("2d");
+
+    function resizeCanvas(){
+      const r = pill.getBoundingClientRect();
+      canvas.width = Math.floor(r.width * devicePixelRatio);
+      canvas.height = Math.floor(r.height * devicePixelRatio);
+    }
+    new ResizeObserver(resizeCanvas).observe(pill);
+    resizeCanvas();
+
+    function rand(min,max){ return Math.random()*(max-min)+min; }
+
+    function playCelebration(){
+      resizeCanvas();
+      canvas.style.opacity = "1";
+      pill.classList.remove("pop");
+      // force reflow so pop restarts
+      void pill.offsetWidth;
+      pill.classList.add("pop");
+
+      const W = canvas.width, H = canvas.height;
+      const originX = Math.floor(W * 0.23); // behind runner
+      const originY = Math.floor(H * 0.52);
+
+      // particles: mix of "sparks" + "confetti"
+      const particles = [];
+      const colors = [
+        [255, 255, 255, 0.95],
+        [255, 210, 0, 0.85],
+        [0, 229, 255, 0.85],
+        [255, 92, 122, 0.75],
+        [170, 255, 120, 0.75]
+      ];
+
+      // sparks (firework rays)
+      for (let i=0;i<70;i++){
+        const a = rand(-Math.PI, Math.PI);
+        const sp = rand(2.0, 6.5) * devicePixelRatio;
+        const c = colors[Math.floor(rand(0, colors.length))];
+        particles.push({
+          type:"spark",
+          x: originX, y: originY,
+          vx: Math.cos(a)*sp,
+          vy: Math.sin(a)*sp,
+          life: rand(18, 34),
+          r: rand(1.2, 2.2)*devicePixelRatio,
+          c
+        });
+      }
+      // confetti bits
+      for (let i=0;i<36;i++){
+        const a = rand(-Math.PI*0.9, Math.PI*0.9);
+        const sp = rand(1.4, 4.2) * devicePixelRatio;
+        const c = colors[Math.floor(rand(0, colors.length))];
+        particles.push({
+          type:"confetti",
+          x: originX, y: originY,
+          vx: Math.cos(a)*sp,
+          vy: Math.sin(a)*sp - rand(1.2, 3.0)*devicePixelRatio,
+          g: rand(0.10, 0.22) * devicePixelRatio,
+          life: rand(40, 70),
+          w: rand(4, 8)*devicePixelRatio,
+          h: rand(2, 4)*devicePixelRatio,
+          rot: rand(0, Math.PI),
+          vr: rand(-0.22, 0.22),
+          c
+        });
+      }
+
+      let frame = 0;
+      function draw(){
+        frame++;
+        ctx.clearRect(0,0,W,H);
+
+        // faint glow behind origin
+        ctx.save();
+        ctx.globalAlpha = 0.15;
+        ctx.beginPath();
+        ctx.arc(originX, originY, 38*devicePixelRatio, 0, Math.PI*2);
+        ctx.fillStyle = "white";
+        ctx.fill();
+        ctx.restore();
+
+        for (const p of particles){
+          p.life -= 1;
+          p.x += p.vx;
+          p.y += p.vy;
+
+          if (p.type === "spark"){
+            p.vx *= 0.96;
+            p.vy *= 0.96;
+            const alpha = Math.max(0, Math.min(1, p.life/34));
+            ctx.save();
+            ctx.globalAlpha = alpha * 0.95;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+            ctx.fillStyle = `rgba(${p.c[0]},${p.c[1]},${p.c[2]},${p.c[3]})`;
+            ctx.fill();
+            ctx.restore();
+          } else {
+            p.vy += p.g;
+            p.rot += p.vr;
+            const alpha = Math.max(0, Math.min(1, p.life/70));
+            ctx.save();
+            ctx.globalAlpha = alpha * 0.85;
+            ctx.translate(p.x, p.y);
+            ctx.rotate(p.rot);
+            ctx.fillStyle = `rgba(${p.c[0]},${p.c[1]},${p.c[2]},${p.c[3]})`;
+            ctx.fillRect(-p.w/2, -p.h/2, p.w, p.h);
+            ctx.restore();
+          }
+        }
+
+        // keep only alive
+        for (let i=particles.length-1;i>=0;i--){
+          if (particles[i].life <= 0) particles.splice(i,1);
+        }
+
+        if (particles.length > 0 && frame < 160){
+          requestAnimationFrame(draw);
+        } else {
+          canvas.style.opacity = "0";
+          setTimeout(()=>{ ctx.clearRect(0,0,W,H); }, 250);
+        }
+      }
+      requestAnimationFrame(draw);
+    }
+
+    // ---- state + milestone logic (no replay on refresh) ----
+    const lsKey = `mileCounter:lastSeen100At:${dbUrl}:${room}`;
+    const lastSeen = Number(localStorage.getItem(lsKey) || "0");
+
+    onValue(roomRef, (snap) => {
+      const data = snap.val() || {};
+      const miles = Number(data.miles ?? 0);
+      const firedAt = Number(data.milestone100FiredAt ?? 0);
+
+      tweenTo(Number.isFinite(miles) ? miles : 0);
+
+      // Play celebration only if firedAt is newer than what this device has seen
+      if (firedAt && firedAt > lastSeen){
+        localStorage.setItem(lsKey, String(firedAt));
+        playCelebration();
+      }
+    });
+  </script>
+</body>
+</html>
